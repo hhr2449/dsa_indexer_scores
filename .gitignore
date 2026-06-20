@@ -1,0 +1,7 @@
+build/
+*.o
+*.so
+*.log
+__pycache__/
+.pytest_cache/
+profile/*.ncu-rep

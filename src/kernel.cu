@@ -27,6 +27,10 @@ __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
+__device__ __forceinline__ void cp_async_wait_one() {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
 __device__ __forceinline__ void prefetch_k_page(
     uint4* k_s, const __nv_bfloat16* k_idx_cache, int physical_page) {
     const uint4* const k_g = reinterpret_cast<const uint4*>(
@@ -56,6 +60,10 @@ struct Accumulator {
     float x[32];
 };
 
+struct QueryFragments {
+    uint32_t x[8][4];
+};
+
 __device__ __forceinline__ void wgmma_fence() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
@@ -65,18 +73,18 @@ __device__ __forceinline__ void wgmma_commit_wait() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void wgmma_m64n64k16(
-    Accumulator& d, uint64_t desc_a, uint64_t desc_b, int accumulate) {
+__device__ __forceinline__ void wgmma_m64n64k16_rs(
+    Accumulator& d, const uint32_t* a, uint64_t desc_b, int accumulate) {
     asm volatile(
         "{\n"
         ".reg .pred p;\n"
-        "setp.ne.b32 p, %34, 0;\n"
+        "setp.ne.b32 p, %37, 0;\n"
         "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
         "{%0,%1,%2,%3,%4,%5,%6,%7,"
         "%8,%9,%10,%11,%12,%13,%14,%15,"
         "%16,%17,%18,%19,%20,%21,%22,%23,"
         "%24,%25,%26,%27,%28,%29,%30,%31},"
-        "%32,%33,p,1,1,0,0;\n"
+        "{%32,%33,%34,%35},%36,p,1,1,0;\n"
         "}\n"
         : "+f"(d.x[0]), "+f"(d.x[1]), "+f"(d.x[2]), "+f"(d.x[3]),
           "+f"(d.x[4]), "+f"(d.x[5]), "+f"(d.x[6]), "+f"(d.x[7]),
@@ -86,11 +94,12 @@ __device__ __forceinline__ void wgmma_m64n64k16(
           "+f"(d.x[20]), "+f"(d.x[21]), "+f"(d.x[22]), "+f"(d.x[23]),
           "+f"(d.x[24]), "+f"(d.x[25]), "+f"(d.x[26]), "+f"(d.x[27]),
           "+f"(d.x[28]), "+f"(d.x[29]), "+f"(d.x[30]), "+f"(d.x[31])
-        : "l"(desc_a), "l"(desc_b), "r"(accumulate));
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "l"(desc_b), "r"(accumulate));
 }
 
 template <int kPagesPerCta>
-__global__ __launch_bounds__(kThreads, 6)
+__global__ __launch_bounds__(kThreads, 4)
 void dsa_indexer_scores_wgmma(
     const __nv_bfloat16* __restrict__ q_idx,
     const __nv_bfloat16* __restrict__ k_idx_cache,
@@ -118,27 +127,36 @@ void dsa_indexer_scores_wgmma(
         return;
     }
 
-    __shared__ __align__(128) uint4 q_s[kVectorsPerMatrix];
-    __shared__ __align__(128) uint4 k_s[kVectorsPerMatrix];
-    __shared__ __align__(16) __nv_bfloat16 w_s[kHeads];
-    __shared__ __align__(16) float partial_s[4][kPageSize];
-
-    const uint4* const q_g = reinterpret_cast<const uint4*>(
-        q_idx + b * kHeads * kDim);
-    // Convert row-major [64,128] into eight GMMA K-major [64,16] tiles.
-    for (int src = threadIdx.x; src < kVectorsPerMatrix; src += kThreads) {
-        const int row = src >> 4;
-        const int vec = src & 15;
-        const int dst = (vec >> 1) * 128 + (vec & 1) * 64 + row;
-        cp_async_16(q_s + dst, q_g + src);
-    }
-    cp_async_commit();
-    if (threadIdx.x < kHeads) {
-        w_s[threadIdx.x] = w_idx[b * kHeads + threadIdx.x];
-    }
+    constexpr int kStages =
+        kPagesPerCta == 1 ? 1 : (kPagesPerCta == 4 ? 2 : 3);
+    __shared__ __align__(128) uint4 k_s[kStages][kVectorsPerMatrix];
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
+    const int row0 = warp * 16 + (lane >> 2);
+    const float w0 = __bfloat162float(w_idx[b * kHeads + row0]);
+    const float w1 = __bfloat162float(w_idx[b * kHeads + row0 + 8]);
+
+    // Register fragment mapping specified by PTX for m64nNk16.  Each thread
+    // owns two adjacent columns from rows row0 and row0+8 in each 16-wide K
+    // tile.  Keeping all eight tiles resident removes Q from shared memory.
+    QueryFragments q_frag;
+    const int col_pair = (lane & 3) * 2;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+        const int col = kt * 16 + col_pair;
+        const __nv_bfloat16* const q0 =
+            q_idx + ((b * kHeads + row0) * kDim + col);
+        const __nv_bfloat16* const q1 = q0 + 8 * kDim;
+        q_frag.x[kt][0] = *reinterpret_cast<const uint32_t*>(q0);
+        q_frag.x[kt][1] = *reinterpret_cast<const uint32_t*>(q1);
+        q_frag.x[kt][2] = *reinterpret_cast<const uint32_t*>(q0 + 8);
+        q_frag.x[kt][3] = *reinterpret_cast<const uint32_t*>(q1 + 8);
+    }
+
+    const int valid_pages_this_cta = min(
+        pages_this_cta,
+        (visible - first_page * kPageSize + kPageSize - 1) / kPageSize);
 
 #pragma unroll
     for (int page_in_cta = 0; page_in_cta < kPagesPerCta; ++page_in_cta) {
@@ -162,10 +180,50 @@ void dsa_indexer_scores_wgmma(
         if (page_in_cta == 0) {
             const int physical_page =
                 block_table[b * max_pages + logical_page];
-            prefetch_k_page(k_s, k_idx_cache, physical_page);
+            prefetch_k_page(k_s[0], k_idx_cache, physical_page);
         }
-        cp_async_wait_all();
+        if constexpr (kStages == 3) {
+            if (page_in_cta == 0 ||
+                page_in_cta + 1 >= valid_pages_this_cta) {
+                cp_async_wait_all();
+            } else {
+                cp_async_wait_one();
+            }
+        } else {
+            cp_async_wait_all();
+        }
         __syncthreads();
+
+        const int stage = page_in_cta % kStages;
+        if constexpr (kStages == 3) {
+            // Large groups keep two future pages in flight to cover random
+            // paged-cache latency.
+            const int first_prefetch =
+                page_in_cta == 0 ? 1 : page_in_cta + 2;
+            const int prefetch_count = page_in_cta == 0 ? 2 : 1;
+#pragma unroll
+            for (int pf = 0; pf < prefetch_count; ++pf) {
+                const int target = first_prefetch + pf;
+                if (target < valid_pages_this_cta) {
+                    const int target_logical_page = first_page + target;
+                    const int target_physical_page =
+                        block_table[b * max_pages + target_logical_page];
+                    prefetch_k_page(k_s[target % kStages], k_idx_cache,
+                                    target_physical_page);
+                }
+            }
+        } else {
+            // Four-page groups favor the fifth resident CTA enabled by the
+            // smaller two-stage shared-memory footprint.
+            const int target = page_in_cta + 1;
+            if (target < valid_pages_this_cta) {
+                const int target_logical_page = first_page + target;
+                const int target_physical_page =
+                    block_table[b * max_pages + target_logical_page];
+                prefetch_k_page(k_s[target % kStages], k_idx_cache,
+                                target_physical_page);
+            }
+        }
 
         Accumulator acc;
 #pragma unroll
@@ -174,27 +232,17 @@ void dsa_indexer_scores_wgmma(
         wgmma_fence();
 #pragma unroll
         for (int kt = 0; kt < 8; ++kt) {
-            const uint64_t desc_q = make_gmma_desc(q_s + kt * 128);
-            const uint64_t desc_k = make_gmma_desc(k_s + kt * 128);
-            wgmma_m64n64k16(acc, desc_q, desc_k, kt != 0);
+            const uint64_t desc_k =
+                make_gmma_desc(k_s[stage] + kt * 128);
+            wgmma_m64n64k16_rs(acc, q_frag.x[kt], desc_k, kt != 0);
         }
         wgmma_commit_wait();
 
-        // WGMMA has finished reading k_s.  Reuse that buffer immediately for
-        // the next page and overlap the copy with this page's register
-        // reduction, shared partial reduction, and output store.
-        const int next_page_in_cta = page_in_cta + 1;
-        if (next_page_in_cta < pages_this_cta &&
-            page_begin + kPageSize < visible) {
-            const int next_logical_page = logical_page + 1;
-            const int next_physical_page =
-                block_table[b * max_pages + next_logical_page];
-            prefetch_k_page(k_s, k_idx_cache, next_physical_page);
-        }
-
-        const int row0 = warp * 16 + (lane >> 2);
-        const float w0 = __bfloat162float(w_s[row0]);
-        const float w1 = __bfloat162float(w_s[row0 + 8]);
+        // WGMMA is done with the current K stage.  Reuse its first 1 KiB for
+        // the four-warp score reduction, keeping total static shared memory
+        // at exactly 48 KiB for the double-buffered specializations.
+        float (*partial_s)[kPageSize] =
+            reinterpret_cast<float (*)[kPageSize]>(k_s[stage]);
 #pragma unroll
         for (int ng = 0; ng < 8; ++ng) {
             const int r = ng * 4;
@@ -229,6 +277,246 @@ void dsa_indexer_scores_wgmma(
     }
 }
 
+__device__ __forceinline__ void named_barrier_sync(int id, int count) {
+    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void named_barrier_arrive(int id, int count) {
+    asm volatile("bar.arrive %0, %1;\n" :: "r"(id), "r"(count) : "memory");
+}
+
+// A single producer warp copies one page.  All 32 operations are consumed at
+// the same wait point, so keep them in one group and commit once per page.
+__device__ __forceinline__ void producer_load_k_page(
+    uint4* k_s, const __nv_bfloat16* k_idx_cache, int physical_page,
+    int lane) {
+    const uint4* const k_g = reinterpret_cast<const uint4*>(
+        k_idx_cache + physical_page * kPageSize * kDim);
+#pragma unroll
+    for (int group = 0; group < 4; ++group) {
+#pragma unroll
+        for (int op = 0; op < 8; ++op) {
+            const int src = lane + (group * 8 + op) * 32;
+            const int row = src >> 4;
+            const int vec = src & 15;
+            const int dst = (vec >> 1) * 128 + (vec & 1) * 64 + row;
+            cp_async_16(k_s + dst, k_g + src);
+        }
+    }
+    cp_async_commit();
+    cp_async_wait_all();
+}
+
+template <int kPagesPerCta, bool kProducerEpilogue>
+__global__ __launch_bounds__(160, 4)
+void dsa_indexer_scores_wgmma_ws(
+    const __nv_bfloat16* __restrict__ q_idx,
+    const __nv_bfloat16* __restrict__ k_idx_cache,
+    const __nv_bfloat16* __restrict__ w_idx,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ context_lens,
+    __nv_bfloat16* __restrict__ scores,
+    int max_pages) {
+    constexpr int kWsThreads = 160;
+    constexpr int kStages = kPagesPerCta == 4 ? 2 : 3;
+    __shared__ __align__(128) uint4 k_s[kStages][kVectorsPerMatrix];
+
+    const int groups_per_batch =
+        (max_pages + kPagesPerCta - 1) / kPagesPerCta;
+    const int group_linear = static_cast<int>(blockIdx.x);
+    const int b = group_linear / groups_per_batch;
+    const int group_in_batch = group_linear - b * groups_per_batch;
+    const int first_page = group_in_batch * kPagesPerCta;
+    const int pages_this_cta = min(kPagesPerCta, max_pages - first_page);
+    const int visible = __ldg(context_lens + b);
+
+    if (first_page * kPageSize >= visible) {
+        __nv_bfloat16* const out =
+            scores + (b * max_pages + first_page) * kPageSize;
+        for (int i = threadIdx.x; i < pages_this_cta * kPageSize;
+             i += kWsThreads) {
+            out[i] = __float2bfloat16(-INFINITY);
+        }
+        return;
+    }
+
+    const int valid_pages = min(
+        pages_this_cta,
+        (visible - first_page * kPageSize + kPageSize - 1) / kPageSize);
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    if (warp == 4) {
+        if constexpr (!kProducerEpilogue) {
+            // Producer only: barriers 0..2 signal ready and 3..5 signal free.
+            for (int p = 0; p < valid_pages; ++p) {
+                const int stage = p % kStages;
+                if (p >= kStages) {
+                    named_barrier_sync(3 + stage, kWsThreads);
+                }
+                int physical_page = 0;
+                if (lane == 0) {
+                    physical_page =
+                        block_table[b * max_pages + first_page + p];
+                }
+                physical_page =
+                    __shfl_sync(0xffffffffu, physical_page, 0);
+                producer_load_k_page(k_s[stage], k_idx_cache,
+                                     physical_page, lane);
+                named_barrier_arrive(stage, kWsThreads);
+            }
+        } else {
+            // Producer + epilogue: load p, then drain p-(kStages-1).
+            for (int step = 0;
+                 step < valid_pages + kStages - 1; ++step) {
+                if (step < valid_pages) {
+                    const int stage = step % kStages;
+                    int physical_page = 0;
+                    if (lane == 0) {
+                        physical_page =
+                            block_table[b * max_pages + first_page + step];
+                    }
+                    physical_page =
+                        __shfl_sync(0xffffffffu, physical_page, 0);
+                    producer_load_k_page(k_s[stage], k_idx_cache,
+                                         physical_page, lane);
+                    named_barrier_arrive(stage, kWsThreads);
+                }
+
+                const int done = step - (kStages - 1);
+                if (done >= 0 && done < valid_pages) {
+                    const int stage = done % kStages;
+                    named_barrier_sync(3 + stage, kWsThreads);
+                    float (*partial_s)[kPageSize] =
+                        reinterpret_cast<float (*)[kPageSize]>(k_s[stage]);
+                    const int logical_page = first_page + done;
+                    const int page_begin = logical_page * kPageSize;
+                    __nv_bfloat16* const out =
+                        scores + (b * max_pages + logical_page) * kPageSize;
+#pragma unroll
+                    for (int token_offset = 0; token_offset < kPageSize;
+                         token_offset += 32) {
+                        const int token = lane + token_offset;
+                        if (page_begin + token < visible) {
+                            float score = partial_s[0][token] +
+                                          partial_s[1][token];
+                            score += partial_s[2][token] +
+                                     partial_s[3][token];
+                            out[token] = __float2bfloat16(score);
+                        } else {
+                            out[token] = __float2bfloat16(-INFINITY);
+                        }
+                    }
+                }
+            }
+
+            const int invalid_pages = pages_this_cta - valid_pages;
+            if (invalid_pages > 0) {
+                __nv_bfloat16* const out = scores +
+                    (b * max_pages + first_page + valid_pages) * kPageSize;
+                for (int i = lane; i < invalid_pages * kPageSize; i += 32) {
+                    out[i] = __float2bfloat16(-INFINITY);
+                }
+            }
+        }
+        return;
+    }
+
+    const int row0 = warp * 16 + (lane >> 2);
+    const float w0 = __bfloat162float(w_idx[b * kHeads + row0]);
+    const float w1 = __bfloat162float(w_idx[b * kHeads + row0 + 8]);
+    QueryFragments q_frag;
+    const int col_pair = (lane & 3) * 2;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+        const int col = kt * 16 + col_pair;
+        const __nv_bfloat16* const q0 =
+            q_idx + ((b * kHeads + row0) * kDim + col);
+        const __nv_bfloat16* const q1 = q0 + 8 * kDim;
+        q_frag.x[kt][0] = *reinterpret_cast<const uint32_t*>(q0);
+        q_frag.x[kt][1] = *reinterpret_cast<const uint32_t*>(q1);
+        q_frag.x[kt][2] = *reinterpret_cast<const uint32_t*>(q0 + 8);
+        q_frag.x[kt][3] = *reinterpret_cast<const uint32_t*>(q1 + 8);
+    }
+
+    for (int p = 0; p < valid_pages; ++p) {
+        const int stage = p % kStages;
+        named_barrier_sync(stage, kWsThreads);
+
+        Accumulator acc;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) acc.x[i] = 0.0f;
+        wgmma_fence();
+#pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            const uint64_t desc_k =
+                make_gmma_desc(k_s[stage] + kt * 128);
+            wgmma_m64n64k16_rs(acc, q_frag.x[kt], desc_k, kt != 0);
+        }
+        wgmma_commit_wait();
+
+        float (*partial_s)[kPageSize] =
+            reinterpret_cast<float (*)[kPageSize]>(k_s[stage]);
+#pragma unroll
+        for (int ng = 0; ng < 8; ++ng) {
+            const int r = ng * 4;
+            float s0 = fmaxf(acc.x[r], 0.0f) * w0 +
+                       fmaxf(acc.x[r + 2], 0.0f) * w1;
+            float s1 = fmaxf(acc.x[r + 1], 0.0f) * w0 +
+                       fmaxf(acc.x[r + 3], 0.0f) * w1;
+#pragma unroll
+            for (int delta = 16; delta >= 4; delta >>= 1) {
+                s0 += __shfl_down_sync(0xffffffffu, s0, delta);
+                s1 += __shfl_down_sync(0xffffffffu, s1, delta);
+            }
+            if (lane < 4) {
+                const int col = ng * 8 + lane * 2;
+                partial_s[warp][col] = s0;
+                partial_s[warp][col + 1] = s1;
+            }
+        }
+
+        if constexpr (kProducerEpilogue) {
+            named_barrier_arrive(3 + stage, kWsThreads);
+        } else {
+            constexpr int kEpilogueBarrier = 6;
+            named_barrier_sync(kEpilogueBarrier, kThreads);
+            if (threadIdx.x < kPageSize) {
+                const int token = threadIdx.x;
+                const int logical_page = first_page + p;
+                const int page_begin = logical_page * kPageSize;
+                __nv_bfloat16* const out =
+                    scores + (b * max_pages + logical_page) * kPageSize;
+                if (page_begin + token < visible) {
+                    float score = partial_s[0][token] +
+                                  partial_s[1][token];
+                    score += partial_s[2][token] +
+                             partial_s[3][token];
+                    out[token] = __float2bfloat16(score);
+                } else {
+                    out[token] = __float2bfloat16(-INFINITY);
+                }
+            }
+            named_barrier_sync(kEpilogueBarrier, kThreads);
+            if (p + kStages < valid_pages) {
+                named_barrier_arrive(3 + stage, kWsThreads);
+            }
+        }
+    }
+
+    if constexpr (!kProducerEpilogue) {
+        const int invalid_pages = pages_this_cta - valid_pages;
+        if (invalid_pages > 0) {
+            __nv_bfloat16* const out = scores +
+                (b * max_pages + first_page + valid_pages) * kPageSize;
+            for (int i = threadIdx.x; i < invalid_pages * kPageSize;
+                 i += kThreads) {
+                out[i] = __float2bfloat16(-INFINITY);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" void run_kernel(
@@ -250,12 +538,28 @@ extern "C" void run_kernel(
     if (blocks64 <= 0) return;
 
     const int max_pages = static_cast<int>(MaxPages);
-    if (blocks64 >= 16384) {
+    if (blocks64 >= 32768) {
+        constexpr int kPages = 64;
+        const int64_t groups_per_batch = (MaxPages + kPages - 1) / kPages;
+        const unsigned int blocks =
+            static_cast<unsigned int>(B * groups_per_batch);
+        dsa_indexer_scores_wgmma_ws<kPages, true><<<blocks, 160>>>(
+            q_idx, k_idx_cache, w_idx, block_table, context_lens, scores,
+            max_pages);
+    } else if (blocks64 >= 16384) {
+        constexpr int kPages = 32;
+        const int64_t groups_per_batch = (MaxPages + kPages - 1) / kPages;
+        const unsigned int blocks =
+            static_cast<unsigned int>(B * groups_per_batch);
+        dsa_indexer_scores_wgmma_ws<kPages, true><<<blocks, 160>>>(
+            q_idx, k_idx_cache, w_idx, block_table, context_lens, scores,
+            max_pages);
+    } else if (blocks64 >= 8192) {
         constexpr int kPages = 16;
         const int64_t groups_per_batch = (MaxPages + kPages - 1) / kPages;
         const unsigned int blocks =
             static_cast<unsigned int>(B * groups_per_batch);
-        dsa_indexer_scores_wgmma<kPages><<<blocks, kThreads>>>(
+        dsa_indexer_scores_wgmma_ws<kPages, true><<<blocks, 160>>>(
             q_idx, k_idx_cache, w_idx, block_table, context_lens, scores,
             max_pages);
     } else if (blocks64 >= 4096) {
@@ -263,7 +567,7 @@ extern "C" void run_kernel(
         const int64_t groups_per_batch = (MaxPages + kPages - 1) / kPages;
         const unsigned int blocks =
             static_cast<unsigned int>(B * groups_per_batch);
-        dsa_indexer_scores_wgmma<kPages><<<blocks, kThreads>>>(
+        dsa_indexer_scores_wgmma_ws<kPages, true><<<blocks, 160>>>(
             q_idx, k_idx_cache, w_idx, block_table, context_lens, scores,
             max_pages);
     } else if (blocks64 >= 2048) {
@@ -271,7 +575,7 @@ extern "C" void run_kernel(
         const int64_t groups_per_batch = (MaxPages + kPages - 1) / kPages;
         const unsigned int blocks =
             static_cast<unsigned int>(B * groups_per_batch);
-        dsa_indexer_scores_wgmma<kPages><<<blocks, kThreads>>>(
+        dsa_indexer_scores_wgmma_ws<kPages, true><<<blocks, 160>>>(
             q_idx, k_idx_cache, w_idx, block_table, context_lens, scores,
             max_pages);
     } else {
